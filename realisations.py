@@ -34,15 +34,77 @@ except Exception as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global variables for database configuration
+def get_remote_config():
+    """Get remote database configuration from environment variables"""
+    config = {
+        "NEO4J_URI": os.getenv("REMOTE_NEO4J_URI"),
+        "NEO4J_USERNAME": os.getenv("REMOTE_NEO4J_USERNAME"),
+        "NEO4J_PASSWORD": os.getenv("REMOTE_NEO4J_PASSWORD")
+    }
+    # Debug logging
+    logger.info("Remote config values:")
+    for key, value in config.items():
+        logger.info(f"{key}: {'[SET]' if value else '[MISSING]'}")
+    return config
+
+def get_local_config():
+    """Get local database configuration from environment variables"""
+    return {
+        "NEO4J_URI": os.getenv("NEO4J_URI"),
+        "NEO4J_USERNAME": os.getenv("NEO4J_USERNAME"),
+        "NEO4J_PASSWORD": os.getenv("NEO4J_PASSWORD")
+    }
+
+# Current database configuration (defaults to local)
+CURRENT_DB_CONFIG = get_local_config()
+
+def choose_database():
+    """Function to choose between local and remote database"""
+    # Reload environment variables
+    load_dotenv(override=True)
+    
+    while True:
+        print("\n=== Database Selection ===")
+        print("1. Local Database (from .env)")
+        print("2. Remote Database")
+        print("Q. Return to Main Menu")
+        
+        choice = input("\nEnter your choice (1-2 or Q): ").strip().upper()
+        
+        if choice == 'Q':
+            return
+            
+        if choice == '1':
+            global CURRENT_DB_CONFIG
+            CURRENT_DB_CONFIG = get_local_config()
+            if not all(CURRENT_DB_CONFIG.values()):
+                logger.error("❌ Missing local database configuration in .env file")
+                return
+            logger.info("✅ Switched to Local Database")
+            return
+            
+        elif choice == '2':
+            remote_config = get_remote_config()
+            if not all(remote_config.values()):
+                logger.error("❌ Missing remote database configuration in .env file")
+                return
+            CURRENT_DB_CONFIG.update(remote_config)
+            logger.info("✅ Switched to Remote Database")
+            return
+            
+        else:
+            print("❌ Invalid choice. Please enter 1, 2, or Q.")
+
 class Neo4jConnection:
     def __init__(self):
         # Load environment variables
         load_dotenv()
         
         # Get Neo4j credentials from environment variables
-        self.uri = os.getenv("NEO4J_URI")
-        self.username = os.getenv("NEO4J_USERNAME")
-        self.password = os.getenv("NEO4J_PASSWORD")
+        self.uri = CURRENT_DB_CONFIG["NEO4J_URI"]
+        self.username = CURRENT_DB_CONFIG["NEO4J_USERNAME"]
+        self.password = CURRENT_DB_CONFIG["NEO4J_PASSWORD"]
         self.driver = None
 
     def connect(self):
@@ -489,9 +551,9 @@ def load_structured_documents():
     client = openai.OpenAI(api_key=api_key)
     
     # Initialize Neo4j connection
-    uri = os.getenv("NEO4J_URI")
-    user = os.getenv("NEO4J_USERNAME")
-    password = os.getenv("NEO4J_PASSWORD")
+    uri = CURRENT_DB_CONFIG["NEO4J_URI"]
+    user = CURRENT_DB_CONFIG["NEO4J_USERNAME"]
+    password = CURRENT_DB_CONFIG["NEO4J_PASSWORD"]
     
     if not all([uri, user, password]):
         logger.error("❌ Missing Neo4j credentials!")
@@ -578,9 +640,9 @@ def search_paragraphs():
     logger.info("Starting paragraph search...")
     
     # Initialize Neo4j connection
-    uri = os.getenv("NEO4J_URI")
-    user = os.getenv("NEO4J_USERNAME")
-    password = os.getenv("NEO4J_PASSWORD")
+    uri = CURRENT_DB_CONFIG["NEO4J_URI"]
+    user = CURRENT_DB_CONFIG["NEO4J_USERNAME"]
+    password = CURRENT_DB_CONFIG["NEO4J_PASSWORD"]
     api_key = os.getenv("OPENAI_API_KEY")
     
     if not all([uri, user, password, api_key]):
@@ -689,12 +751,13 @@ def main():
     """Main function with interactive menu"""
     while True:
         print("\n=== Neo4j Vector Operations Menu ===")
-        print("1. Load Structured Documents")
-        print("2. Manage Indexes")
-        print("3. Search Paragraphs")
+        print("1. Choose Database")
+        print("2. Load Structured Documents")
+        print("3. Manage Indexes")
+        print("4. Search Paragraphs")
         print("Q. Quit")
         
-        choice = input("\nEnter your choice (1-3 or Q): ").strip().upper()
+        choice = input("\nEnter your choice (1-4 or Q): ").strip().upper()
         
         if choice == 'Q':
             print("Goodbye!")
@@ -702,15 +765,17 @@ def main():
             
         try:
             if choice == '1':
-                load_structured_documents()
+                choose_database()
             elif choice == '2':
-                manage_vector_indexes(os.getenv("NEO4J_URI"), 
-                                   os.getenv("NEO4J_USERNAME"), 
-                                   os.getenv("NEO4J_PASSWORD"))
+                load_structured_documents()
             elif choice == '3':
+                manage_vector_indexes(CURRENT_DB_CONFIG["NEO4J_URI"], 
+                                   CURRENT_DB_CONFIG["NEO4J_USERNAME"], 
+                                   CURRENT_DB_CONFIG["NEO4J_PASSWORD"])
+            elif choice == '4':
                 search_paragraphs()
             else:
-                print("❌ Invalid choice. Please enter a number between 1 and 3 or Q to quit.")
+                print("❌ Invalid choice. Please enter a number between 1 and 4 or Q to quit.")
                 
         except Exception as e:
             logger.error(f"❌ An error occurred: {str(e)}")
