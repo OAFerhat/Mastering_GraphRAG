@@ -1153,8 +1153,232 @@ def migrate_database_content():
         remote_driver.close()
         local_driver.close()
 
+def get_embedding_stats(session):
+    """Get statistics about embeddings in the database"""
+    # First, let's check what node types and properties exist
+    print("\nDiagnostic Information:")
+    
+    # Check total nodes
+    total_nodes_query = session.run("MATCH (n) RETURN count(n) as count")
+    total_nodes = total_nodes_query.single()['count']
+    print(f"Total nodes in database: {total_nodes}")
+    
+    # Check node labels
+    labels_query = session.run("CALL db.labels()")
+    labels = [record['label'] for record in labels_query]
+    print(f"Node labels in database: {labels}")
+    
+    # Check properties for each label
+    print("\nProperties by label:")
+    for label in labels:
+        props_query = session.run(f"MATCH (n:`{label}`) RETURN keys(n) as props LIMIT 1")
+        props = props_query.single()['props'] if props_query.peek() else []
+        embedding_props = [p for p in props if 'embedding' in p.lower()]
+        if embedding_props:
+            print(f"{label}: {embedding_props}")
+    
+    print("\nGathering embedding statistics...")
+    
+    # Initialize results with all labels
+    results = []
+    for label in labels:
+        # Get total nodes for this label
+        label_count_query = session.run(f"""
+            MATCH (n:`{label}`)
+            RETURN count(n) as total_nodes
+        """)
+        label_total_nodes = label_count_query.single()['total_nodes']
+        
+        # Get embedding properties for this label
+        props_query = session.run(f"""
+            MATCH (n:`{label}`)
+            WITH keys(n) as props
+            UNWIND [prop in props WHERE toLower(prop) CONTAINS 'embedding'] as embeddingProp
+            RETURN DISTINCT embeddingProp
+        """)
+        
+        embedding_props = [record['embeddingProp'] for record in props_query]
+        
+        if embedding_props:  # If the label has embedding properties
+            for prop in embedding_props:
+                # Get stats for this label and property
+                stats_query = session.run(f"""
+                    MATCH (n:`{label}`)
+                    WHERE n.`{prop}` IS NOT NULL
+                    RETURN count(n) as embeddings_count
+                """)
+                
+                if stats_query.peek():
+                    stat = stats_query.single()
+                    results.append({
+                        'label': label,
+                        'embedding_property': prop,
+                        'embeddings_count': stat['embeddings_count'],
+                        'total_nodes': label_total_nodes,
+                        'coverage': (stat['embeddings_count'] / label_total_nodes * 100) if label_total_nodes > 0 else 0
+                    })
+        else:  # If the label has no embedding properties
+            results.append({
+                'label': label,
+                'embedding_property': '',
+                'embeddings_count': 0,
+                'total_nodes': label_total_nodes,
+                'coverage': 0
+            })
+    
+    # Get vector index information
+    index_info = session.run("""
+        SHOW VECTOR INDEXES
+        YIELD name, type, labelsOrTypes, properties
+        RETURN name, labelsOrTypes[0] as label, properties[0] as property
+    """)
+    
+    # Create a set of indexed label-property pairs
+    indexed_pairs = {
+        (record['label'], record['property'])
+        for record in index_info
+    }
+    
+    # Add index information to results
+    for result in results:
+        result['indexed'] = (result['label'], result['embedding_property']) in indexed_pairs if result['embedding_property'] else False
+    
+    # Sort results by label and embedding property
+    results.sort(key=lambda x: (x['label'], x['embedding_property']))
+    
+    return results
+
+def display_embedding_stats(stats):
+    """Display embedding statistics in a formatted table"""
+    from tabulate import tabulate
+    import colorama
+    from colorama import Fore, Style
+    
+    # Initialize colorama for Windows compatibility
+    colorama.init()
+    
+    # Prepare rows for the table
+    rows = []
+    for i, stat in enumerate(stats, 1):
+        # Use colored checkmarks/crosses for index status
+        index_status = f"{Fore.GREEN}✓{Style.RESET_ALL}" if stat['indexed'] else f"{Fore.RED}✗{Style.RESET_ALL}"
+        
+        rows.append([
+            i,  # Row number
+            stat['label'],
+            stat['embedding_property'],
+            stat['embeddings_count'],
+            stat['total_nodes'],
+            f"{stat['coverage']:.1f}%",
+            index_status
+        ])
+    
+    # Display table
+    headers = ['#', 'Label', 'Embedding Property', 'With Embedding', 'Total Nodes', 'Coverage', 'Indexed']
+    print("\nEmbedding Statistics:")
+    print(tabulate(rows, headers=headers, tablefmt='grid'))
+
+def manage_indexes():
+    """Manage vector indexes in the database"""
+    try:
+        # Create and connect to database
+        connection = Neo4jConnection()
+        if not connection.connect():
+            print("Failed to connect to database")
+            return
+            
+        with connection.driver.session() as session:
+            while True:
+                # Get current stats
+                stats = get_embedding_stats(session)
+                display_embedding_stats(stats)
+                
+                print("\nOptions:")
+                print("1. Create vector index")
+                print("2. Drop vector index")
+                print("3. Back to main menu")
+                
+                choice = input("\nEnter your choice (1-3): ")
+                
+                if choice == '1':
+                    # Show only unindexed embeddings
+                    unindexed = [s for s in stats if not s['indexed']]
+                    if not unindexed:
+                        print("All embedding properties are already indexed.")
+                        continue
+                    
+                    print("\nAvailable embedding properties to index:")
+                    for i, stat in enumerate(unindexed, 1):
+                        print(f"{i}. {stat['label']}.{stat['embedding_property']}")
+                    
+                    try:
+                        idx = int(input("\nEnter the number of the embedding to index (0 to cancel): "))
+                        if idx == 0:
+                            continue
+                        if 1 <= idx <= len(unindexed):
+                            stat = unindexed[idx-1]
+                            index_name = f"vector_{stat['label'].lower()}_{stat['embedding_property'].lower()}"
+                            
+                            # Create vector index
+                            session.run(f"""
+                                CREATE VECTOR INDEX {index_name}
+                                FOR (n:`{stat['label']}`)
+                                ON (n.{stat['embedding_property']})
+                                OPTIONS {{indexConfig: {{
+                                    `vector.dimensions`: 1536,
+                                    `vector.similarity_function`: 'cosine'
+                                }}}}
+                            """)
+                            print(f"✓ Created vector index {index_name}")
+                    except ValueError:
+                        print("Invalid input. Please enter a number.")
+                    except Exception as e:
+                        print(f"Error creating index: {str(e)}")
+                
+                elif choice == '2':
+                    # Show only indexed embeddings
+                    indexed = [s for s in stats if s['indexed']]
+                    if not indexed:
+                        print("No indexed embedding properties found.")
+                        continue
+                    
+                    print("\nIndexed embedding properties:")
+                    for i, stat in enumerate(indexed, 1):
+                        print(f"{i}. {stat['label']}.{stat['embedding_property']}")
+                    
+                    try:
+                        idx = int(input("\nEnter the number of the index to drop (0 to cancel): "))
+                        if idx == 0:
+                            continue
+                        if 1 <= idx <= len(indexed):
+                            stat = indexed[idx-1]
+                            index_name = f"vector_{stat['label'].lower()}_{stat['embedding_property'].lower()}"
+                            
+                            # Drop vector index
+                            session.run(f"DROP INDEX {index_name}")
+                            print(f"✓ Dropped vector index {index_name}")
+                    except ValueError:
+                        print("Invalid input. Please enter a number.")
+                    except Exception as e:
+                        print(f"Error dropping index: {str(e)}")
+                
+                elif choice == '3':
+                    break
+                
+                else:
+                    print("Invalid choice. Please enter a number between 1 and 3.")
+    except Exception as e:
+        print(f"Error connecting to database: {str(e)}")
+    finally:
+        if 'connection' in locals():
+            connection.close()
+
 def main():
     """Main function with interactive menu"""
+    # Initialize with local database
+    CURRENT_DB_CONFIG.update(get_local_config())
+    logger.info("✅ Successfully connected to local Neo4j database!")
+    
     while True:
         print("\n=== Neo4j Vector Operations Menu ===")
         print("1. Choose Database")
@@ -1164,32 +1388,27 @@ def main():
         print("5. Migrate Database Content")
         print("Q. Quit")
         
-        choice = input("\nEnter your choice (1-5 or Q): ").strip().upper()
+        choice = input("\nEnter your choice: ").strip().upper()
         
-        if choice == 'Q':
-            print("Goodbye!")
-            break
-            
         try:
             if choice == '1':
                 choose_database()
             elif choice == '2':
                 load_structured_documents()
             elif choice == '3':
-                manage_vector_indexes(CURRENT_DB_CONFIG["NEO4J_URI"], 
-                                   CURRENT_DB_CONFIG["NEO4J_USERNAME"], 
-                                   CURRENT_DB_CONFIG["NEO4J_PASSWORD"])
+                manage_indexes()
             elif choice == '4':
                 search_paragraphs()
             elif choice == '5':
                 migrate_database_content()
+            elif choice == 'Q':
+                print("Exiting...")
+                break
             else:
-                print("❌ Invalid choice. Please enter a number between 1 and 5 or Q to quit.")
-                
+                print("Invalid choice. Please try again.")
         except Exception as e:
-            logger.error(f"❌ An error occurred: {str(e)}")
-            
-        input("\nPress Enter to continue...")
+            print(f"An error occurred: {str(e)}")
+            logger.error(f"Error in main menu: {str(e)}")
 
 if __name__ == "__main__":
     main()
