@@ -244,7 +244,7 @@ def drop_vector_index(session, label):
         # Get the index name for this label
         query = """
             SHOW INDEXES
-            YIELD name, type, labelsOrTypes
+            YIELD name, type, labelsOrTypes, properties
             WHERE type = 'VECTOR'
             AND labelsOrTypes[0] = $label
             RETURN name
@@ -747,6 +747,412 @@ def search_paragraphs():
     finally:
         db.close()
 
+def get_database_statistics(session):
+    """Get node and relationship statistics from database"""
+    # Get all distinct label combinations and their counts
+    node_stats = session.run("""
+        MATCH (n)
+        WITH labels(n) as labels
+        WITH CASE 
+            WHEN size(labels) > 0 THEN labels 
+            ELSE ['(no label)'] 
+        END as labelSet
+        RETURN labelSet, count(*) as count
+        ORDER BY labelSet
+    """)
+    
+    # Get regular relationship statistics
+    rel_types = session.run("CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType")
+    
+    rel_stats = []
+    for record in rel_types:
+        rel_type = record['relationshipType']
+        # For ACTED_IN and DIRECTED, exclude cases where both relationships exist
+        if rel_type in ['ACTED_IN', 'DIRECTED']:
+            result = session.run("""
+                MATCH (a)-[r:`""" + rel_type + """`]->(b:Movie)
+                WHERE NOT (
+                    r.type = 'ACTED_IN' AND exists((a)-[:DIRECTED]->(b))
+                    OR
+                    r.type = 'DIRECTED' AND exists((a)-[:ACTED_IN]->(b))
+                )
+                RETURN 
+                    $rel_type as relationshipType,
+                    labels(a) as fromLabels,
+                    labels(b) as toLabels,
+                    count(r) as count
+            """, rel_type=rel_type)
+        else:
+            result = session.run("""
+                MATCH (a)-[r:`""" + rel_type + """`]->(b)
+                RETURN 
+                    $rel_type as relationshipType,
+                    labels(a) as fromLabels,
+                    labels(b) as toLabels,
+                    count(r) as count
+            """, rel_type=rel_type)
+        stats = result.single()
+        if stats and stats['count'] > 0:
+            rel_stats.append(stats)
+    
+    # Add special case for dual ACTED_IN/DIRECTED relationships
+    dual_rel_result = session.run("""
+        MATCH (p:Person)-[:ACTED_IN]->(m:Movie)
+        MATCH (p)-[:DIRECTED]->(m)
+        RETURN 
+            'ACTED_IN+DIRECTED' as relationshipType,
+            labels(p) as fromLabels,
+            labels(m) as toLabels,
+            count(*) as count
+    """)
+    dual_stats = dual_rel_result.single()
+    if dual_stats and dual_stats['count'] > 0:
+        rel_stats.append(dual_stats)
+    
+    return list(node_stats), rel_stats
+
+def display_migration_menu(node_stats, rel_stats):
+    """Display formatted table of nodes and relationships with counts"""
+    from tabulate import tabulate
+    
+    # Combine nodes and relationships in a single list
+    all_rows = []
+    
+    # Add nodes first
+    for i, stat in enumerate(node_stats, 1):
+        label_str = ':'.join(stat['labelSet'])
+        all_rows.append([
+            i, 
+            "Node",
+            label_str,
+            "-",
+            "-",
+            stat['count']
+        ])
+    
+    # Add relationships
+    start_idx = len(node_stats) + 1
+    for i, stat in enumerate(rel_stats, start_idx):
+        from_labels = ':'.join(stat['fromLabels'])
+        to_labels = ':'.join(stat['toLabels'])
+        rel_type = stat['relationshipType']
+        # Add special formatting for dual relationships
+        if rel_type == 'ACTED_IN+DIRECTED':
+            rel_display = "ACTED_IN+DIRECTED (same movie)"
+        else:
+            rel_display = rel_type
+            
+        all_rows.append([
+            i,
+            "Relationship",
+            from_labels,
+            rel_display,
+            to_labels,
+            stat['count']
+        ])
+    
+    # Display table
+    print("\nAvailable Items for Migration:")
+    headers = ['#', 'Type', 'From', 'Relationship/Label', 'To', 'Count']
+    print(tabulate(all_rows, headers=headers, tablefmt='grid'))
+    return all_rows
+
+def ensure_unique_constraint(session, labels):
+    """Ensure unique constraint exists for remote_id on given labels"""
+    # Convert labels list to string if necessary
+    if isinstance(labels, list):
+        labels = labels
+    else:
+        labels = [labels]
+    
+    try:
+        # Get existing constraints using schema()
+        constraints_result = session.run("""
+            CALL db.schema.constraints()
+            YIELD name, description
+        """)
+        
+        # Parse the constraints to find which labels already have remote_id constraints
+        existing_constraints = set()
+        for record in constraints_result:
+            description = record.get('description', '')
+            # Parse the constraint description to extract the label
+            if 'remote_id IS UNIQUE' in description:
+                # Extract label from the description using string manipulation
+                start_idx = description.find('( ') + 2
+                end_idx = description.find(':')
+                if start_idx > 1 and end_idx > start_idx:
+                    label_part = description[end_idx+1:description.find(' )', end_idx)]
+                    existing_constraints.add(label_part.strip())
+        
+        # Create individual constraints for each label if they don't exist
+        for label in labels:
+            if label not in existing_constraints:
+                constraint_name = f"unique_{label.lower()}_remote_id"
+                query = f"""
+                    CREATE CONSTRAINT {constraint_name} IF NOT EXISTS
+                    FOR (n:{label})
+                    REQUIRE n.remote_id IS UNIQUE
+                """
+                session.run(query)
+                logger.info(f"✓ Created unique constraint for {label}")
+            else:
+                logger.debug(f"✓ Unique constraint already exists for {label}")
+                
+    except Exception as e:
+        # If we can't check constraints, just try to create them
+        logger.debug(f"Could not check existing constraints: {str(e)}")
+        logger.debug("Falling back to direct constraint creation")
+        for label in labels:
+            try:
+                constraint_name = f"unique_{label.lower()}_remote_id"
+                query = f"""
+                    CREATE CONSTRAINT {constraint_name} IF NOT EXISTS
+                    FOR (n:{label})
+                    REQUIRE n.remote_id IS UNIQUE
+                """
+                session.run(query)
+            except Exception as create_error:
+                logger.warning(f"Could not create constraint for {label}: {str(create_error)}")
+
+def migrate_selected_item(selection, node_stats, rel_stats, remote_session, local_session):
+    """Migrate selected node type or relationship"""
+    all_rows = node_stats + rel_stats
+    if selection < 1 or selection > len(all_rows):
+        logger.error("Invalid selection")
+        return
+    
+    # Adjust index for 0-based list
+    idx = selection - 1
+    
+    # Check if it's a node or relationship based on the selection
+    if idx < len(node_stats):
+        # Node migration code remains the same...
+        labels = node_stats[idx]['labelSet']
+        label_str = ':'.join(labels)
+        logger.info(f"Migrating nodes with labels: {label_str}")
+        
+        # Ensure unique constraint exists
+        ensure_unique_constraint(local_session, labels)
+        
+        result = remote_session.run(f"""
+            MATCH (n:{label_str})
+            RETURN 
+                elementId(n) as id,
+                properties(n) as props
+        """)
+        
+        nodes_data = list(result)
+        if not nodes_data:
+            logger.info(f"No nodes found with labels {label_str}")
+            return
+            
+        logger.info(f"Found {len(nodes_data)} nodes with labels {label_str}")
+        
+        # Create nodes in batches
+        batch_size = 1000
+        for i in range(0, len(nodes_data), batch_size):
+            batch = nodes_data[i:i + batch_size]
+            for node in batch:
+                # Extract all properties and add remote_id
+                props = dict(node['props'])
+                remote_id = str(node['id'])  # Convert to string to ensure consistent handling
+                props['remote_id'] = remote_id
+                
+                # Create a parameter dict for each property
+                params = {f"prop_{k}": v for k, v in props.items()}
+                params['remote_id'] = remote_id
+                
+                # Build the SET clause
+                set_clause = ", ".join(f"n.{k} = ${f'prop_{k}'}" for k in props.keys())
+                
+                merge_query = f"""
+                MERGE (n:{label_str} {{remote_id: $remote_id}})
+                ON CREATE SET {set_clause}
+                ON MATCH SET {set_clause}
+                """
+                
+                try:
+                    local_session.run(merge_query, params)
+                except Exception as e:
+                    logger.error(f"Error creating node: {str(e)}")
+                    continue
+                    
+            logger.info(f"Processed {min(i + batch_size, len(nodes_data))} nodes...")
+    else:
+        # Relationship migration
+        rel_idx = idx - len(node_stats)
+        rel_type = rel_stats[rel_idx]['relationshipType']
+        from_label = rel_stats[rel_idx]['fromLabels']
+        to_label = rel_stats[rel_idx]['toLabels']
+        
+        if rel_type == 'ACTED_IN+DIRECTED':
+            logger.info(f"Migrating dual relationships: {':'.join(from_label)}-[ACTED_IN+DIRECTED]->{':'.join(to_label)}")
+            
+            rel_result = remote_session.run("""
+                MATCH (p:Person)-[:ACTED_IN]->(m:Movie)
+                MATCH (p)-[:DIRECTED]->(m)
+                RETURN 
+                    elementId(p) as start_id,
+                    elementId(m) as end_id,
+                    properties(p) as start_props,
+                    properties(m) as end_props
+            """)
+        elif rel_type in ['ACTED_IN', 'DIRECTED']:
+            logger.info(f"Migrating relationships: {':'.join(from_label)}-[{rel_type}]->{':'.join(to_label)} (excluding dual relationships)")
+            
+            rel_result = remote_session.run(f"""
+                MATCH (a)-[r:{rel_type}]->(b:Movie)
+                WHERE NOT (
+                    r.type = 'ACTED_IN' AND exists((a)-[:DIRECTED]->(b))
+                    OR
+                    r.type = 'DIRECTED' AND exists((a)-[:ACTED_IN]->(b))
+                )
+                RETURN 
+                    elementId(a) as start_id,
+                    elementId(b) as end_id,
+                    properties(r) as props
+            """)
+        else:
+            logger.info(f"Migrating relationships: {':'.join(from_label)}-[{rel_type}]->{':'.join(to_label)}")
+            
+            rel_result = remote_session.run(f"""
+                MATCH (a)-[r:{rel_type}]->(b)
+                RETURN 
+                    elementId(a) as start_id,
+                    elementId(b) as end_id,
+                    properties(r) as props
+            """)
+        
+        rels_data = list(rel_result)
+        if not rels_data:
+            logger.info(f"No relationships found")
+            return
+            
+        logger.info(f"Found {len(rels_data)} relationships")
+        
+        # Create relationships in batches
+        batch_size = 1000
+        for i in range(0, len(rels_data), batch_size):
+            batch = rels_data[i:i + batch_size]
+            for rel in batch:
+                # Extract all properties
+                props = dict(rel.get('props', {}))
+                start_id = str(rel['start_id'])
+                end_id = str(rel['end_id'])
+                
+                params = {
+                    'start_id': start_id,
+                    'end_id': end_id,
+                    **{f'prop_{k}': v for k, v in props.items()}
+                }
+                
+                set_clause = ", ".join(f"r.{k} = ${f'prop_{k}'}" for k in props.keys()) if props else ""
+                
+                if rel_type == 'ACTED_IN+DIRECTED':
+                    # Create both relationships
+                    rel_queries = [
+                        f"""
+                        MATCH (a:{':'.join(from_label)} {{remote_id: $start_id}})
+                        MATCH (b:{':'.join(to_label)} {{remote_id: $end_id}})
+                        MERGE (a)-[r:ACTED_IN]->(b)
+                        """ + (f"ON CREATE SET {set_clause}" if set_clause else ""),
+                        f"""
+                        MATCH (a:{':'.join(from_label)} {{remote_id: $start_id}})
+                        MATCH (b:{':'.join(to_label)} {{remote_id: $end_id}})
+                        MERGE (a)-[r:DIRECTED]->(b)
+                        """ + (f"ON CREATE SET {set_clause}" if set_clause else "")
+                    ]
+                    for query in rel_queries:
+                        try:
+                            local_session.run(query, params)
+                        except Exception as e:
+                            logger.error(f"Error creating relationship: {str(e)}")
+                            continue
+                else:
+                    rel_query = f"""
+                    MATCH (a:{':'.join(from_label)} {{remote_id: $start_id}})
+                    MATCH (b:{':'.join(to_label)} {{remote_id: $end_id}})
+                    MERGE (a)-[r:{rel_type}]->(b)
+                    """ + (f"ON CREATE SET {set_clause}" if set_clause else "")
+                    
+                    try:
+                        local_session.run(rel_query, params)
+                    except Exception as e:
+                        logger.error(f"Error creating relationship: {str(e)}")
+                        continue
+                    
+            logger.info(f"Processed {min(i + batch_size, len(rels_data))} relationships...")
+            
+def migrate_database_content():
+    """Migrate data from remote to local database by appending content"""
+    logger.info("Starting database migration process...")
+    
+    # Get remote connection details
+    remote_config = get_remote_config()
+    remote_uri = remote_config["NEO4J_URI"]
+    remote_username = remote_config["NEO4J_USERNAME"]
+    remote_password = remote_config["NEO4J_PASSWORD"]
+    
+    # Get local connection details
+    local_config = get_local_config()
+    local_uri = local_config["NEO4J_URI"]
+    local_username = local_config["NEO4J_USERNAME"]
+    local_password = local_config["NEO4J_PASSWORD"]
+    
+    try:
+        # Connect to remote database
+        remote_driver = GraphDatabase.driver(remote_uri, auth=(remote_username, remote_password))
+        local_driver = GraphDatabase.driver(local_uri, auth=(local_username, local_password))
+        
+        with remote_driver.session() as remote_session, local_driver.session() as local_session:
+            while True:
+                # Get statistics from remote database
+                node_stats, rel_stats = get_database_statistics(remote_session)
+                
+                # Display menu and get selection
+                all_rows = display_migration_menu(node_stats, rel_stats)
+                
+                print("\nEnter the number of the item you want to migrate (0 to exit):")
+                try:
+                    selection = int(input("> "))
+                    if selection == 0:
+                        break
+                    
+                    # Migrate selected item
+                    migrate_selected_item(selection, node_stats, rel_stats, remote_session, local_session)
+                    
+                    # Ask if user wants to continue
+                    print("\nDo you want to migrate another item? (y/n):")
+                    if input("> ").lower() != 'y':
+                        break
+                        
+                except ValueError:
+                    logger.error("Please enter a valid number")
+                    continue
+            
+            # Clean up temporary properties
+            logger.info("Cleaning up temporary properties...")
+            local_session.run("""
+                MATCH (n)
+                WHERE n._remote_id IS NOT NULL
+                REMOVE n._remote_id
+            """)
+            
+            # Show final statistics
+            local_nodes = local_session.run("MATCH (n) RETURN count(n) as count").single()['count']
+            local_rels = local_session.run("MATCH ()-[r]->() RETURN count(r) as count").single()['count']
+            logger.info(f"✅ Migration completed!")
+            logger.info(f"Total nodes in local database: {local_nodes}")
+            logger.info(f"Total relationships in local database: {local_rels}")
+            
+    except Exception as e:
+        logger.error(f"❌ Error during migration: {str(e)}")
+        raise
+    finally:
+        remote_driver.close()
+        local_driver.close()
+
 def main():
     """Main function with interactive menu"""
     while True:
@@ -755,9 +1161,10 @@ def main():
         print("2. Load Structured Documents")
         print("3. Manage Indexes")
         print("4. Search Paragraphs")
+        print("5. Migrate Database Content")
         print("Q. Quit")
         
-        choice = input("\nEnter your choice (1-4 or Q): ").strip().upper()
+        choice = input("\nEnter your choice (1-5 or Q): ").strip().upper()
         
         if choice == 'Q':
             print("Goodbye!")
@@ -774,8 +1181,10 @@ def main():
                                    CURRENT_DB_CONFIG["NEO4J_PASSWORD"])
             elif choice == '4':
                 search_paragraphs()
+            elif choice == '5':
+                migrate_database_content()
             else:
-                print("❌ Invalid choice. Please enter a number between 1 and 4 or Q to quit.")
+                print("❌ Invalid choice. Please enter a number between 1 and 5 or Q to quit.")
                 
         except Exception as e:
             logger.error(f"❌ An error occurred: {str(e)}")
