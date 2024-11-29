@@ -771,11 +771,6 @@ def get_database_statistics(session):
         if rel_type in ['ACTED_IN', 'DIRECTED']:
             result = session.run("""
                 MATCH (a)-[r:`""" + rel_type + """`]->(b:Movie)
-                WHERE NOT (
-                    r.type = 'ACTED_IN' AND exists((a)-[:DIRECTED]->(b))
-                    OR
-                    r.type = 'DIRECTED' AND exists((a)-[:ACTED_IN]->(b))
-                )
                 RETURN 
                     $rel_type as relationshipType,
                     labels(a) as fromLabels,
@@ -999,15 +994,10 @@ def migrate_selected_item(selection, node_stats, rel_stats, remote_session, loca
                     properties(m) as end_props
             """)
         elif rel_type in ['ACTED_IN', 'DIRECTED']:
-            logger.info(f"Migrating relationships: {':'.join(from_label)}-[{rel_type}]->{':'.join(to_label)} (excluding dual relationships)")
+            logger.info(f"Migrating relationships: {':'.join(from_label)}-[{rel_type}]->{':'.join(to_label)}")
             
             rel_result = remote_session.run(f"""
-                MATCH (a)-[r:{rel_type}]->(b:Movie)
-                WHERE NOT (
-                    r.type = 'ACTED_IN' AND exists((a)-[:DIRECTED]->(b))
-                    OR
-                    r.type = 'DIRECTED' AND exists((a)-[:ACTED_IN]->(b))
-                )
+                MATCH (a)-[r:{rel_type}]->(b)
                 RETURN 
                     elementId(a) as start_id,
                     elementId(b) as end_id,
